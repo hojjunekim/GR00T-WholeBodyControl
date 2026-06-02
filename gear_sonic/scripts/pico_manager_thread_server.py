@@ -1771,12 +1771,39 @@ class PlannerStreamer:
                 left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                 right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
 
+            # Right-grip-hold squat: while right_grip > 0.5, send mode=IDLE_SQUAT
+            # at height=0.64m. On the zmq_manager input path the C++ trusts the
+            # mode field directly (no auto-switch by height, unlike the ROS2
+            # input handler), so we MUST override both `mode_to_send` and
+            # `height` together for the squat to register. right_grip is
+            # otherwise inert in the hand control path (generate_finger_data
+            # ignores its `grip` param), so reusing it here doesn't conflict
+            # with anything.
+            squat_height = -1.0
+            try:
+                _, _, _, _, right_grip_now = get_controller_inputs()
+                if right_grip_now > 0.5:
+                    squat_height = 0.64
+                    mode_to_send = LocomotionMode.IDLE_SQUAT
+                if not hasattr(self, "_prev_squat_print"):
+                    self._prev_squat_print = False
+                _squat_now = right_grip_now > 0.5
+                if _squat_now != self._prev_squat_print:
+                    print(
+                        f"[PlannerLoop] squat={'ON ' if _squat_now else 'off'} "
+                        f"right_grip={right_grip_now:.2f} -> mode={mode_to_send.name} "
+                        f"height={squat_height}"
+                    )
+                    self._prev_squat_print = _squat_now
+            except Exception:
+                pass
+
             msg = build_planner_message(
                 mode_to_send.value,
                 movement,
                 facing,
                 speed=speed,
-                height=-1.0,
+                height=squat_height,
                 upper_body_position=upper_body_position,
                 left_hand_position=left_hand_position,
                 right_hand_position=right_hand_position,

@@ -24,11 +24,7 @@ class ImageViewer:
             cols = min(num_images, 3)  # Max 3 columns
             rows = (num_images + cols - 1) // cols
 
-            # Adjust figure size based on number of images
-            fig_width = self.figsize[0] * min(cols, 2)
-            fig_height = self.figsize[1] * rows / 2
-
-            self._fig, axes = plt.subplots(rows, cols, figsize=(fig_width, fig_height))
+            self._fig, axes = plt.subplots(rows, cols, figsize=self.figsize)
             self._fig.suptitle(self.title)
 
             # Flatten axes array for easier access

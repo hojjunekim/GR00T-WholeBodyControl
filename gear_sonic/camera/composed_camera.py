@@ -17,6 +17,8 @@ Supported camera types: ``oak``, ``oak_mono``, ``realsense``,
 Run ``python -m gear_sonic.camera.composed_camera --help`` for all options.
 """
 
+from __future__ import annotations
+
 from collections import deque
 from dataclasses import dataclass
 import queue
@@ -100,6 +102,16 @@ class ComposedCameraConfig:
     mjpeg_quality: int = 80
     """MJPEG quality 1-100 (only when use_mjpeg=True)."""
 
+    realsense_auto_exposure: bool = True
+    """RealSense color-sensor auto-exposure. Pass --no-realsense-auto-exposure to disable."""
+
+    realsense_manual_exposure_us: int = 8500
+    """RealSense manual exposure in microseconds (used when --no-realsense-auto-exposure)."""
+
+    control_port: int = 0
+    """ZMQ REP control port for runtime camera commands (set_exposure, etc.).
+    0 = default to `port + 1` (e.g. 5556 when port=5555). Set explicitly to override."""
+
     def __post_init__(self):
         self.run_as_server = self.server
 
@@ -115,6 +127,10 @@ class ComposedCameraSensor(Sensor, SensorServer):
         self.error_events: dict[str, threading.Event] = {}
         self.error_messages: dict[str, str] = {}
         self._observation_spaces: dict[str, Any] = {}
+        # mount_position -> live sensor instance, populated by the worker thread
+        # after a successful init. Used by the control-REP socket to dispatch
+        # runtime commands (e.g. set_exposure). Cleared on disconnect.
+        self.cameras: dict[str, Any] = {}
 
         camera_configs = self._get_camera_configs()
 
@@ -255,6 +271,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
                                 f"(attempt {attempt + 1}/{max_init_retries})..."
                             )
                         camera = self._instantiate_camera(mount_position, camera_type, device_id)
+                        self.cameras[mount_position] = camera
                         print(f"[{mount_position}] Camera initialized successfully")
                         break
                     except Exception as e:
@@ -319,6 +336,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
                             time.sleep(0.01)
 
                 if camera is not None:
+                    self.cameras.pop(mount_position, None)
                     try:
                         camera.close()
                     except Exception as e:
@@ -333,6 +351,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
             except Exception as e:
                 print(f"[{mount_position}] Camera error: {e}")
                 if camera is not None:
+                    self.cameras.pop(mount_position, None)
                     try:
                         camera.close()
                     except Exception:
@@ -373,10 +392,13 @@ class ComposedCameraSensor(Sensor, SensorServer):
             return OAKSensor(config=oak_config, mount_position=mount_position, device_id=device_id)
 
         elif camera_type == "realsense":
-            from gear_sonic.camera.drivers.realsense import RealSenseSensor
+            from gear_sonic.camera.drivers.realsense import RealSenseConfig, RealSenseSensor
 
+            rs_config = RealSenseConfig()
+            rs_config.auto_exposure = self.config.realsense_auto_exposure
+            rs_config.manual_exposure_us = self.config.realsense_manual_exposure_us
             print(f"Initializing RealSense sensor for camera type: {camera_type}")
-            return RealSenseSensor(mount_position=mount_position)
+            return RealSenseSensor(config=rs_config, mount_position=mount_position)
 
         elif camera_type.endswith(".mp4"):
             from gear_sonic.camera.drivers.dummy import ReplayDummySensor
@@ -457,8 +479,69 @@ class ComposedCameraSensor(Sensor, SensorServer):
         img_schema = ImageMessageSchema(timestamps=all_timestamps, images=all_images)
         return img_schema.serialize()
 
+    def _control_server_loop(self, port: int):
+        """ZMQ REP loop that lets a CLI tool tweak camera options at runtime.
+
+        Protocol (msgpack):
+          request : {"cmd": "set_exposure", "camera": "ego_view",
+                     "auto": bool, "exposure_us": int (optional)}
+                    {"cmd": "list_cameras"}
+          reply   : {"ok": bool, "msg": str, ...}
+        """
+        import zmq
+        import msgpack
+
+        ctx = zmq.Context()
+        rep = ctx.socket(zmq.REP)
+        rep.bind(f"tcp://*:{port}")
+        print(f"[ComposedCamera] Control REP server bound on tcp://*:{port}")
+        while True:
+            try:
+                raw = rep.recv()
+                req = msgpack.unpackb(raw, raw=False)
+                reply = self._handle_control_command(req)
+            except Exception as e:
+                reply = {"ok": False, "msg": f"control error: {e}"}
+            try:
+                rep.send(msgpack.packb(reply, use_bin_type=True))
+            except Exception as e:
+                print(f"[ComposedCamera] control reply send failed: {e}")
+
+    def _handle_control_command(self, req: dict) -> dict:
+        cmd = req.get("cmd")
+        if cmd == "list_cameras":
+            return {"ok": True, "cameras": list(self.cameras.keys())}
+        cam_name = req.get("camera", "ego_view")
+        cam = self.cameras.get(cam_name)
+        if cam is None:
+            return {"ok": False, "msg": f"camera '{cam_name}' not running"}
+        if cmd == "set_exposure":
+            if not hasattr(cam, "set_exposure"):
+                return {"ok": False, "msg": f"camera '{cam_name}' has no set_exposure()"}
+            msg = cam.set_exposure(bool(req.get("auto", True)), req.get("exposure_us"))
+            return {"ok": True, "msg": msg}
+        if cmd == "set_white_balance":
+            if not hasattr(cam, "set_white_balance"):
+                return {"ok": False, "msg": f"camera '{cam_name}' has no set_white_balance()"}
+            msg = cam.set_white_balance(bool(req.get("auto", True)), req.get("kelvin"))
+            return {"ok": True, "msg": msg}
+        if cmd == "get_status":
+            if not hasattr(cam, "get_status"):
+                return {"ok": False, "msg": f"camera '{cam_name}' has no get_status()"}
+            return {"ok": True, "status": cam.get_status()}
+        if cmd == "get_intrinsics":
+            if not hasattr(cam, "get_intrinsics"):
+                return {"ok": False, "msg": f"camera '{cam_name}' has no get_intrinsics()"}
+            return {"ok": True, "intrinsics": cam.get_intrinsics()}
+        return {"ok": False, "msg": f"unknown cmd: {cmd!r}"}
+
     def run_server(self):
         """Main server loop — reads, serializes and publishes frames."""
+        control_port = self.config.control_port or (self.config.port + 1)
+        threading.Thread(
+            target=self._control_server_loop, args=(control_port,), daemon=True
+        ).start()
+
         idx = 0
         server_start_time = time.monotonic()
         fps_print_time = time.monotonic()

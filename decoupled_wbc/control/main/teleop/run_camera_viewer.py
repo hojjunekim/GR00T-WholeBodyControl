@@ -174,7 +174,7 @@ def main(config: ArgsConfig):
     if not config.offscreen:
         viewer = ImageViewer(
             title="Camera Viewer",
-            figsize=(10, 8),
+            figsize=(30, 20),
             num_images=len(camera_titles),
             image_titles=camera_titles,
         )

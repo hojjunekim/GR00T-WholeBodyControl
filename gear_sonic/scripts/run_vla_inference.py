@@ -41,7 +41,7 @@ from gear_sonic.utils.data_collection.keyboard_subscriber import (
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity
 from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
-from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
+from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN, LATENT_START_POSE
 from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
     concat_action,
@@ -117,6 +117,21 @@ class InferenceConfig:
     # Debug
     verbose_timing: bool = False
     """Whether to always print timing info (not just when loop is slow)."""
+
+    sequential_chunks: bool = False
+    """Execute each action chunk fully before requesting the next one (no time-based replanning)."""
+
+    binary_gripper: bool = False
+    """Map policy hand joint output to binary open/close: close when max(abs) > threshold, else open."""
+
+    binary_gripper_threshold: float = 0.10
+    """Threshold above which the policy hand output triggers full close."""
+
+    remap_wigs_gripper: bool = False
+    """Permute 7-dim hand output from WiGS alphabetical order to SONIC thumb-first order.
+    WiGS dataset bug: joints stored as [index_0, index_1, middle_0, middle_1, thumb_0, thumb_1, thumb_2].
+    Correct SONIC order: [thumb_0, thumb_1, thumb_2, index_0, index_1, middle_0, middle_1].
+    Permutation: model_output[[4,5,6,0,1,2,3]] → correctly-ordered output."""
 
 
 def print_green(x):
@@ -278,8 +293,10 @@ def run_policy_inference_and_process(policy, observation, robot_model):
     try:
         action, _info = policy.get_action(observation)
 
+
         action.pop("task_progress", None)
         action.pop("action.task_progress", None)
+
 
         motion_key = "motion_token" if "motion_token" in action else "action.motion_token"
         if np.abs(action[motion_key]).max() > 1.25:
@@ -407,9 +424,8 @@ def main(config: InferenceConfig):
     initial_pose_left_hand_closed = False
     initial_pose_right_hand_closed = False
 
-    def publish_initial_pose():
-        """Publish initial pose command to move robot to starting position."""
-        print("Moving to initial pose")
+    def publish_pose_smooth(target_token: np.ndarray, steps: int = 40, dt: float = 0.05):
+        """Interpolate from current token_state to target over steps*dt seconds."""
         left_hand = (
             _compute_closed_hand_joints("L")
             if initial_pose_left_hand_closed
@@ -420,15 +436,29 @@ def main(config: InferenceConfig):
             if initial_pose_right_hand_closed
             else np.zeros(7, dtype=np.float32)
         )
-        zmq_message = pack_latent_action_message(
-            motion_token=LATENT_INITIAL_MOTION_TOKEN,
-            frame_index=np.array([0], dtype=np.int64),
-            left_hand_joints=left_hand,
-            right_hand_joints=right_hand,
-        )
-        zmq_socket.send(zmq_message)
+        # Get current token from latest state message
+        current_state = state_subscriber.get_msg()
+        if current_state is not None and "token_state" in current_state:
+            start_token = np.array(current_state["token_state"], dtype=np.float32)
+        else:
+            start_token = target_token.copy()
+
+        for i in range(1, steps + 1):
+            alpha = i / steps
+            interp_token = (1.0 - alpha) * start_token + alpha * target_token
+            zmq_socket.send(pack_latent_action_message(
+                motion_token=interp_token,
+                frame_index=np.array([0], dtype=np.int64),
+                left_hand_joints=left_hand,
+                right_hand_joints=right_hand,
+            ))
+            time.sleep(dt)
+
+    def publish_initial_pose():
+        """Publish initial pose command to move robot to starting position."""
+        print("Moving to initial pose")
+        publish_pose_smooth(LATENT_INITIAL_MOTION_TOKEN)
         print_green("Sent latent initial pose via ZMQ")
-        time.sleep(1.0)
         print("Initial pose done.")
 
     def send_cpp_control_command(start: bool, planner: bool = False):
@@ -457,6 +487,7 @@ def main(config: InferenceConfig):
     action_chunk_index = 0
     last_inference_time = 0.0
     inference_interval = 1.0 / config.rate
+    _dbg_step39_seen = False  # for debug print de-duplication
 
     zmq_frame_counter = 0
 
@@ -489,7 +520,7 @@ def main(config: InferenceConfig):
         elif key == "f":
             print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
         elif key == "i":
-            print("Moving to initial pose")
+            print("Moving to ideal pose (neutral standing)")
             zmq_frame_counter = 0
             print("Reset ZMQ frame counter")
             publish_initial_pose()
@@ -503,6 +534,18 @@ def main(config: InferenceConfig):
                     print("Warning: Failed to switch to POSE mode")
             elif not cpp_loop_running:
                 print("Note: C++ loop not running - press 'k' to start")
+        elif key == "o":
+            print("Moving to task start pose (arms at 90 degrees)")
+            zmq_frame_counter = 0
+            if cpp_loop_running and cpp_mode == "PLANNER":
+                if send_cpp_control_command(start=True, planner=False):
+                    print("Switched to POSE mode (from PLANNER mode)")
+            elif not cpp_loop_running:
+                print("Note: C++ loop not running - press 'k' to start")
+            publish_pose_smooth(LATENT_START_POSE)
+            print_green("Sent task start pose via ZMQ")
+            cached_action_chunk = None
+            action_chunk_index = 0
         elif key == "p":
             pause_loop = not pause_loop
             print(f"{'Paused' if pause_loop else 'Resumed'} policy loop")
@@ -577,25 +620,79 @@ def main(config: InferenceConfig):
             try:
                 processed_action, inference_start_time = result_queue.get_nowait()
                 inference_delay = time.monotonic() - inference_start_time
-                action_chunk_index = calculate_latency_compensated_index(
-                    inference_delay, config.action_publish_rate, config.action_horizon
-                )
+                if config.sequential_chunks:
+                    action_chunk_index = 0
+                else:
+                    action_chunk_index = calculate_latency_compensated_index(
+                        inference_delay, config.action_publish_rate, config.action_horizon
+                    )
                 cached_action_chunk = processed_action
                 last_inference_time = time.monotonic()
+                _dbg_step39_seen = False  # reset for new chunk
+                # DEBUG: read fresh state and compute right EEF in pelvis frame
+                # so we can verify state progression across chunks.
+                try:
+                    _dbg_state = state_subscriber.get_msg(clear=False)
+                    if _dbg_state is not None:
+                        _dbg_state["left_hand_q"][5] = _dbg_state["left_hand_q"][3]
+                        _dbg_state["left_hand_q"][6] = _dbg_state["left_hand_q"][4]
+                        _dbg_q = robot_model.get_configuration_from_actuated_joints(
+                            body_actuated_joint_values=_dbg_state["body_q"],
+                            left_hand_actuated_joint_values=_dbg_state["left_hand_q"],
+                            right_hand_actuated_joint_values=_dbg_state["right_hand_q"],
+                        )
+                        robot_model.cache_forward_kinematics(np.asarray(_dbg_q, dtype=np.float64))
+                        _T_root = robot_model.frame_placement("pelvis").homogeneous
+                        _T_R    = robot_model.frame_placement("right_hand_palm_link").homogeneous
+                        _T_L    = robot_model.frame_placement("left_hand_palm_link").homogeneous
+                        _R_local = np.linalg.inv(_T_root) @ _T_R
+                        _L_local = np.linalg.inv(_T_root) @ _T_L
+                        _dbg_eef = (
+                            f"R_eef=({_R_local[0,3]:+.3f},{_R_local[1,3]:+.3f},{_R_local[2,3]:+.3f}) "
+                            f"L_eef=({_L_local[0,3]:+.3f},{_L_local[1,3]:+.3f},{_L_local[2,3]:+.3f})"
+                        )
+                    else:
+                        _dbg_eef = "[no state msg]"
+                except Exception as _e:
+                    _dbg_eef = f"[fk err: {_e}]"
+                # DEBUG: predicted gripper values at step 0 (and remapped, if enabled)
+                try:
+                    _l = np.asarray(get_action_field(processed_action, "left_hand_joints"), dtype=np.float32)
+                    _r = np.asarray(get_action_field(processed_action, "right_hand_joints"), dtype=np.float32)
+                    if _l.ndim == 3: _l = _l[0]
+                    if _r.ndim == 3: _r = _r[0]
+                    _l0 = _l[0] if _l.ndim == 2 else _l
+                    _r0 = _r[0] if _r.ndim == 2 else _r
+                    _raw = f"L_grip_raw={np.array2string(_l0, precision=2, suppress_small=True)} R_grip_raw={np.array2string(_r0, precision=2, suppress_small=True)}"
+                    if config.remap_wigs_gripper:
+                        _perm = np.array([4, 5, 6, 0, 1, 2, 3])
+                        _l0_p = _l0[_perm]; _r0_p = _r0[_perm]
+                        _dbg_grip = f"{_raw} | L_grip_perm={np.array2string(_l0_p, precision=2, suppress_small=True)} R_grip_perm={np.array2string(_r0_p, precision=2, suppress_small=True)}"
+                    else:
+                        _dbg_grip = _raw
+                except Exception as _e:
+                    _dbg_grip = f"[grip dbg err: {_e}]"
                 print_green(
                     f'New action chunk (prompt: "{language_prompt_ref[0]}", '
-                    f"latency: {inference_delay:.3f}s)"
+                    f"latency: {inference_delay:.3f}s) | {_dbg_eef}"
                 )
+                print(f"  {_dbg_grip}")
             except queue.Empty:
                 pass
 
             worker_is_busy = inference_busy_event.is_set()
-            should_start = should_trigger_new_inference(
-                cached_chunk_exists=(cached_action_chunk is not None),
-                inference_thread_running=worker_is_busy,
-                time_since_last_inference=(time.monotonic() - last_inference_time),
-                inference_interval=inference_interval,
-            )
+            # Sequential chunk execution: trigger next inference when current chunk is exhausted
+            chunk_exhausted = (action_chunk_index >= config.action_horizon - 1)
+            no_chunk_yet = (cached_action_chunk is None)
+            if config.sequential_chunks:
+                should_start = (no_chunk_yet or chunk_exhausted) and not worker_is_busy
+            else:
+                should_start = should_trigger_new_inference(
+                    cached_chunk_exists=(cached_action_chunk is not None),
+                    inference_thread_running=worker_is_busy,
+                    time_since_last_inference=(time.monotonic() - last_inference_time),
+                    inference_interval=inference_interval,
+                )
 
             if should_start:
                 try:
@@ -652,6 +749,27 @@ def main(config: InferenceConfig):
                     if right_hand_joints.ndim == 2:
                         right_hand_joints = right_hand_joints[current_idx]
 
+                    # WiGS gripper-order remap: model trained with alphabetical
+                    # [i0,i1,m0,m1,t0,t1,t2] but SONIC expects thumb-first
+                    # [t0,t1,t2,i0,i1,m0,m1]. Apply BEFORE binary_gripper so the
+                    # max(abs) check is over the same values either way.
+                    if config.remap_wigs_gripper:
+                        _wigs_perm = np.array([4, 5, 6, 0, 1, 2, 3])
+                        left_hand_joints = left_hand_joints[_wigs_perm]
+                        right_hand_joints = right_hand_joints[_wigs_perm]
+
+                    # Binary gripper: map to full close or full open
+                    if config.binary_gripper:
+                        thr = config.binary_gripper_threshold
+                        if np.abs(right_hand_joints).max() > thr:
+                            right_hand_joints = _compute_closed_hand_joints("R")
+                        else:
+                            right_hand_joints = np.zeros(7, dtype=np.float32)
+                        if np.abs(left_hand_joints).max() > thr:
+                            left_hand_joints = _compute_closed_hand_joints("L")
+                        else:
+                            left_hand_joints = np.zeros(7, dtype=np.float32)
+
                     frame_index = np.array([zmq_frame_counter], dtype=np.int64)
                     zmq_frame_counter += 1
 
@@ -662,12 +780,59 @@ def main(config: InferenceConfig):
                         right_hand_joints=right_hand_joints,
                     )
                     zmq_socket.send(zmq_message)
-                    if zmq_frame_counter % 50 == 0:
-                        print_green(
-                            f"ZMQ: Sent latent action - "
-                            f"frame: {frame_index[0]}, "
-                            f"token shape: {motion_token.shape}"
-                        )
+
+                    # Per-step motion-token stats. GR00T's "velocity command" lives
+                    # inside this 64-d latent; the C++ deploy decodes it into base
+                    # velocity + joint targets. We print stats every step so we can
+                    # tell whether the latent is actually evolving across the chunk
+                    # (vs. policy emitting the same token 40 times).
+                    _tok_abs = np.abs(motion_token)
+                    print(
+                        f"  [step={action_chunk_index:2d}] "
+                        f"tok |max|={_tok_abs.max():.3f} "
+                        f"|mean|={_tok_abs.mean():.3f} "
+                        f"L2={float(np.linalg.norm(motion_token)):.3f} "
+                        f"head={np.array2string(motion_token[:4], precision=2, suppress_small=True)}",
+                        flush=True,
+                    )
+
+                    # DEBUG: sample EEF + gripper mid-chunk so we can see the
+                    # trajectory shape, not just at chunk boundaries.
+                    # Only fire each index ONCE per chunk; after chunk is exhausted,
+                    # action_chunk_index clamps at horizon-1 and would re-trigger.
+                    _dbg_max_step = config.action_horizon - 1
+                    _is_clamped = (action_chunk_index == _dbg_max_step
+                                   and _dbg_step39_seen)
+                    _dbg_target_steps = (0, 10, 20, 30, _dbg_max_step)
+                    if (action_chunk_index in _dbg_target_steps
+                            and not _is_clamped):
+                        if action_chunk_index == _dbg_max_step:
+                            _dbg_step39_seen = True
+                        try:
+                            _dbg_s = state_subscriber.get_msg(clear=False)
+                            if _dbg_s is not None:
+                                _dbg_s["left_hand_q"][5] = _dbg_s["left_hand_q"][3]
+                                _dbg_s["left_hand_q"][6] = _dbg_s["left_hand_q"][4]
+                                _dq = robot_model.get_configuration_from_actuated_joints(
+                                    body_actuated_joint_values=_dbg_s["body_q"],
+                                    left_hand_actuated_joint_values=_dbg_s["left_hand_q"],
+                                    right_hand_actuated_joint_values=_dbg_s["right_hand_q"],
+                                )
+                                robot_model.cache_forward_kinematics(np.asarray(_dq, dtype=np.float64))
+                                _T_r = robot_model.frame_placement("pelvis").homogeneous
+                                _T_R = robot_model.frame_placement("right_hand_palm_link").homogeneous
+                                _R_loc = np.linalg.inv(_T_r) @ _T_R
+                                _r_meas = np.asarray(_dbg_s["right_hand_q"], dtype=np.float32)
+                                _l_meas = np.asarray(_dbg_s["left_hand_q"], dtype=np.float32)
+                                print(
+                                    f"  [step={action_chunk_index:2d}] "
+                                    f"R_eef=({_R_loc[0,3]:+.3f},{_R_loc[1,3]:+.3f},{_R_loc[2,3]:+.3f}) "
+                                    f"tok_max={np.abs(motion_token).max():.3f} | "
+                                    f"R_cmd={np.array2string(right_hand_joints, precision=2, suppress_small=True)} "
+                                    f"R_meas={np.array2string(_r_meas, precision=2, suppress_small=True)}"
+                                )
+                        except Exception:
+                            pass
 
                 action_chunk_index = min(action_chunk_index + 1, config.action_horizon - 1)
 

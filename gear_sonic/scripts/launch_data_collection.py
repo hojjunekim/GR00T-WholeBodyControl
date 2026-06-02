@@ -132,7 +132,7 @@ class DataCollectionLaunchConfig:
     dataset_name: str = ""
     """Dataset name for the data exporter. Leave empty to auto-generate from timestamp."""
 
-    data_exporter_frequency: int = 50
+    data_exporter_frequency: int = 30
     """Data collection frequency (Hz) for the data exporter."""
 
     record_wrist_cameras: bool = False
@@ -145,7 +145,7 @@ class DataCollectionLaunchConfig:
     camera_viewer: bool = True
     """Start the camera viewer pane."""
 
-    camera_host: str = "localhost"
+    camera_host: str = "192.168.123.164"
     """Camera server host (shared by data exporter and viewer)."""
 
     camera_port: int = 5555

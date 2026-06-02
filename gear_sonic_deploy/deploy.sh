@@ -551,6 +551,11 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo -e "${GREEN}🚀 Starting deployment...${NC}"
     echo ""
     
+    # Override CycloneDDS config for sim mode (prevent enp2s0 xml from conflicting with lo)
+    if [[ "$ENV_TYPE" == "sim" ]]; then
+        export CYCLONEDDS_URI="<CycloneDDS><Domain id=\"any\"><General><NetworkInterfaceAddress>lo</NetworkInterfaceAddress><AllowMulticast>false</AllowMulticast></General></Domain></CycloneDDS>"
+    fi
+
     # Build the command with optional extra args
     if [[ -n "$EXTRA_ARGS" ]]; then
         just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
