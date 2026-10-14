@@ -5,3 +5,5 @@ build/
 target/
 logs/
 *.trt
+# CSV logs of LEGS data collection (run_collection.sh: --logs-dir collect_logs)
+collect_logs/
