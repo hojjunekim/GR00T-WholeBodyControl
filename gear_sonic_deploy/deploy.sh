@@ -204,13 +204,13 @@ show_usage() {
     echo ""
     echo "Options:"
     echo "  -h, --help              Show this help message"
-    echo "  --cp, --checkpoint PATH Set the checkpoint path (default: policy/checkpoints/example/model_step_000000)"
-    echo "  --obs-config PATH       Set the observation config file (default: policy/configs/example.yaml)"
-    echo "  --planner PATH          Set the planner model path (default: planner/example.onnx)"
-    echo "  --motion-data PATH      Set the motion data path (default: reference/example_motion/)"
-    echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
-    echo "  --output-type TYPE      Set the output type (default: ros2)"
-    echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
+    echo "  --cp, --checkpoint PATH Set the checkpoint path (default: $CHECKPOINT_DEFAULT)"
+    echo "  --obs-config PATH       Set the observation config file (default: $OBS_CONFIG_DEFAULT)"
+    echo "  --planner PATH          Set the planner model path (default: $PLANNER_DEFAULT)"
+    echo "  --motion-data PATH      Set the motion data path (default: $MOTION_DATA_DEFAULT)"
+    echo "  --input-type TYPE       Set the input type (default: $INPUT_TYPE_DEFAULT)"
+    echo "  --output-type TYPE      Set the output type (default: $OUTPUT_TYPE_DEFAULT)"
+    echo "  --zmq-host HOST         Set the ZMQ host (default: $ZMQ_HOST_DEFAULT)"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -483,7 +483,7 @@ echo ""
 # Step 3: Setup Environment & Build
 # ============================================================================
 
-echo -e "${BLUE}[Step 3/4]${NC} Setting up environment and building..."
+echo -e "${BLUE}[Step 3/4]${NC} Setting up environment..."
 
 # Source the environment setup script
 echo "Sourcing environment setup..."
@@ -491,9 +491,8 @@ set +e  # Temporarily allow errors (for jetson_clocks on non-Jetson systems)
 source scripts/setup_env.sh
 set -e  # Re-enable exit on error
 
-# Always build to ensure we have the latest version
-echo "Building the project..."
-# just build
+# No rebuild here: build once with `just build`, and again after changing the C++ code.
+echo "Using the existing build (run 'just build' to rebuild)."
 
 echo ""
 

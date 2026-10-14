@@ -177,6 +177,8 @@ huggingface/
 
 # Mujoco
 MUJOCO_LOG.TXT
+# Scene XML written by LEGS scripts/main/scene_config.py
+gear_sonic/data/robot_model/model_data/g1/generated_scene.xml
 
 # IsaacDeploy
 external_dependencies/isaac_teleop_app/isaac-deploy
